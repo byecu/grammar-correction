@@ -1,147 +1,110 @@
-import datasets
-import nncf
 import openvino as ov
-import time
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
 
-from contextlib import contextmanager
-from jiwer import wer, wer_standardize
-from nncf.quantization.range_estimator import (
-    RangeEstimatorParameters,
-    StatisticsCollectorParameters,
-    StatisticsType,
-)
-from optimum.intel import OVModelForSeq2SeqLM
-from optimum.intel.openvino.quantization import InferRequestWrapper
-from pathlib import Path
-from tqdm.auto import tqdm
-from typing import List, Dict
-from transformers import Pipeline, pipeline, PreTrainedTokenizer
+core = ov.Core()
 
-CALIBRATION_DATASET_SIZE = 10
+model_face = core.read_model(model='model/face-detection-adas-0001.xml')
+compiled_model_face = core.compile_model(model = model_face, device_name="CPU")
 
+input_layer_face = compiled_model_face.input(0)
+output_layer_face = compiled_model_face.output(0)
 
-def collect_calibration_data(grammar_corrector_pipe_fp32: Pipeline, calibration_dataset_size: int) -> List[Dict]:
-    calibration_data = []
-    ov_decoder = grammar_corrector_pipe_fp32.model.decoder_with_past
+model_emo = core.read_model(model='model/emotions-recognition-retail-0003.xml')
+compiled_model_emo = core.compile_model(model = model_emo, device_name="CPU")
 
-    # Wrap decoder inference for data collection
-    ov_decoder.request = InferRequestWrapper(ov_decoder.request, calibration_data, apply_caching=True)
+input_layer_emo = compiled_model_emo.input(0)
+output_layer_emo = compiled_model_emo.output(0)
 
-    # Run inference for data collection
-    try:
-        calibration_dataset = datasets.load_dataset("jfleg", split="validation")
-        calibration_dataset = calibration_dataset.shuffle(seed=42)[:calibration_dataset_size]
-        for data_item in tqdm(
-            calibration_dataset["sentence"],
-            total=calibration_dataset_size,
-            desc="Collecting calibration data",
-        ):
-            grammar_corrector_pipe_fp32(data_item)
-    finally:
-        ov_decoder.request = ov_decoder.request.request
+model_ag = core.read_model(model='model/age-gender-recognition-retail-0013.xml')
+compiled_model_ag = core.compile_model(model = model_ag, device_name="CPU")
 
-    return calibration_data
+input_layer_ag = compiled_model_ag.input(0)
+output_layer_ag = compiled_model_ag.output
 
+def preprocess(image, input_layer_face):
+    N, input_channels, input_height, input_width = input_layer_face.shape
+    
+    resized_image = cv2.resize(image, (input_width,input_height))
+    transposed_image = resized_image.transpose(2, 0, 1)
+    input_image = np.expand_dims(transposed_image, 0)
 
-def quantize(
-    grammar_corrector_pipe_fp32: Pipeline,
-    core: ov.Core,
-    quantized_model_path: Path,
-    calibration_dataset_size: int,
-):
-    if quantized_model_path.exists():
-        print("Loading quantized model")
-        quantized_model = core.read_model(model=quantized_model_path)
-    else:
-        calibration_data = collect_calibration_data(grammar_corrector_pipe_fp32, calibration_dataset_size)
-        ov_decoder = grammar_corrector_pipe_fp32.model.decoder_with_past
-        quantized_model = nncf.quantize(
-            ov_decoder.model,
-            calibration_dataset=nncf.Dataset(calibration_data),
-            subset_size=len(calibration_data),
-            model_type=nncf.ModelType.TRANSFORMER,
-            advanced_parameters=nncf.AdvancedQuantizationParameters(
-                disable_bias_correction=True,
-                # Disable bias correction because the model does not contain quantizable operations with bias
-                activations_range_estimator_params=RangeEstimatorParameters(
-                    # Quantile statistic is employed due to outliers in some activations
-                    # This parameter was found useful by quantize_with_accuracy_control method
-                    max=StatisticsCollectorParameters(StatisticsType.QUANTILE)
-                ),
-            ),
-        )
+    return input_image
 
-        if not quantized_model_path.parent.exists():
-            quantized_model_path.parent.mkdir(parents=True)
-        ov.save_model(quantized_model, quantized_model_path)
+def find_faceboxes(image, results, confidence_threshold):
+    results = results.squeeze()
 
-    return quantized_model
+    scores = results[:,2]
+    boxes = results[:, -4:]
 
+    face_boxes = boxes[scores >= confidence_threshold]
+    scores = scores[scores >= confidence_threshold]
 
-def get_quantized_pipeline(
-    grammar_corrector_pipe: Pipeline,
-    grammar_corrector_tokenizer: PreTrainedTokenizer,
-    core: ov.Core,
-    grammar_corrector_dir: Path,
-    quantized_model_path: Path,
-    device: str,
-    calibration_dataset_size=CALIBRATION_DATASET_SIZE,
-):
-    # Get quantized OV model
-    quantized_model = quantize(grammar_corrector_pipe, core, quantized_model_path, calibration_dataset_size)
+    image_h, image_w, image_channels = image.shape
+    face_boxes = face_boxes*np.array([image_w, image_h, image_w, image_h])
+    face_boxes = face_boxes.astype(np.int64)
 
-    # Load quantized model into grammar correction pipeline
-    grammar_corrector_model_int8 = OVModelForSeq2SeqLM.from_pretrained(grammar_corrector_dir, device=device)
-    grammar_corrector_model_int8.decoder_with_past.model = quantized_model
-    grammar_corrector_model_int8.decoder_with_past.request = None
-    grammar_corrector_model_int8.decoder_with_past._compile()
-    grammar_corrector_pipe_int8 = pipeline(
-        "text2text-generation",
-        model=grammar_corrector_model_int8,
-        tokenizer=grammar_corrector_tokenizer,
-    )
+    return face_boxes, scores
 
-    return grammar_corrector_pipe_int8
+def draw_age_gender_emotion(face_boxes, image):
+
+    EMOTION_NAMES = ['neutral', 'happy', 'sad', 'surprise', 'anger']
+
+    show_image = image.copy()
+
+    for i in range(len(face_boxes)):
+
+        xmin, ymin, xmax, ymax = face_boxes[i]
+        face = image[ymin:ymax, xmin:xmax]
+        # --- emotion ---
+        input_image = preprocess(face, input_layer_emo)
+        results_emo = compiled_model_emo([input_image])[output_layer_emo]
+        
+        results_emo = results_emo.squeeze()
+        index = np.argmax(results_emo)
+
+        
+        # --- emotion ---
+        
+
+        # --- age and gender ---
+        input_image_ag = preprocess(face, input_layer_ag)
+        results_ag = compiled_model_ag([input_image_ag])
+        age, gender = results_ag[1], results_ag[0]
+        age = np.squeeze(age)
+        age = int(age*100)
+
+        gender = np.squeeze(gender)
+
+        if (gender[0]>=0.65):
+            gender = 'female'
+            box_color = (200, 200, 0)
+        
+        elif (gender[1]>=0.55):
+            gender = 'male'
+            box_color = (0, 200, 200)
+    
+        else:
+            gender = "unknown"
+            box_color = (200, 200, 200)
+
+        # --- age and gender ---
+
+        fontScale = image.shape[1]/750
 
 
-def calculate_compression_rate(model_path_ov, model_path_ov_int8):
-    model_size_fp32 = model_path_ov.with_suffix(".bin").stat().st_size / 1024
-    model_size_int8 = model_path_ov_int8.with_suffix(".bin").stat().st_size / 1024
-    print("Model footprint comparison:")
-    print(f"    * FP32 IR model size: {model_size_fp32:.2f} KB")
-    print(f"    * INT8 IR model size: {model_size_int8:.2f} KB")
-    return model_size_fp32, model_size_int8
+        text = gender + ' ' + str(age) + ' ' + EMOTION_NAMES[index]
+        cv2.putText(show_image, text, (xmin, ymin), cv2.FONT_HERSHEY_SIMPLEX, fontScale, (0, 200, 0), 2)
+        cv2.rectangle(img=show_image, pt1=(xmin,ymin), pt2=(xmax,ymax), color=box_color, thickness=2)
 
 
-def calculate_inference_time_and_accuracy(grammar_corrector_pipe: Pipeline, test_subset_size: int):
-    ground_truths = []
-    predictions = []
-    inference_time = []
+    return show_image
 
-    test_dataset = datasets.load_dataset("jfleg", split="test").shuffle(seed=42)[:test_subset_size]
-    zipped_dataset = zip(test_dataset["sentence"], test_dataset["corrections"])
-    for input_text, references in tqdm(zipped_dataset, total=test_subset_size, desc="Evaluation"):
-        # For example, a sample pair may look like:
-        # input_text: "For not use car . "
-        # references: [ "Not for use with a car . ", "Do not use in the car . ", "Car not for use . "]
+def predict_image(image, conf_threshold):
+    input_image = preprocess(image, input_layer_face)
+    results = compiled_model_face([input_image])[output_layer_face]
+    face_boxes, scores = find_faceboxes(image, results, conf_threshold)
+    visualize_image = draw_age_gender_emotion(face_boxes, image)
 
-        start_time = time.perf_counter()
-        corrected_text = grammar_corrector_pipe(input_text)[0]["generated_text"]
-        end_time = time.perf_counter()
-        delta_time = end_time - start_time
-
-        ground_truths.extend(references)
-        predictions.extend([corrected_text] * len(references))
-        inference_time.append(delta_time)
-
-    word_accuracy = (
-        1
-        - wer(
-            ground_truths,
-            predictions,
-            reference_transform=wer_standardize,
-            hypothesis_transform=wer_standardize,
-        )
-    ) * 100
-    sum_inference_time = sum(inference_time)
-    return sum_inference_time, word_accuracy
+    return visualize_image 
