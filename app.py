@@ -4,6 +4,7 @@ import cv2
 import numpy
 import utils
 import io
+from camera_input_live import camera_input_live
 
 def play_video(video_source):
     camera = cv2.VideoCapture(video_source)
@@ -19,6 +20,13 @@ def play_video(video_source):
         else:
             camera.release()
             break
+
+def play_live_camera():
+    image = camera_input_live()
+    uploaded_image = PIL.Image.open(image)
+    uploaded_image_cv = cv2.cvtColor(numpy.array(uploaded_image), cv2.COLOR_RGB2BGR)
+    visualized_image = utils.predict_image(uploaded_image_cv, conf_threshold)
+    st.image(visualized_image, channels = "BGR")
 
 st.set_page_config(
     page_title="Facial Detection",
@@ -82,4 +90,4 @@ if source_radio == "VIDEO":
         st.write("Click on 'Browse Files' in the sidebar to run inference on an video.")
 
 if source_radio == "WEBCAM":
-    play_video(0)
+    play_live_camera()
